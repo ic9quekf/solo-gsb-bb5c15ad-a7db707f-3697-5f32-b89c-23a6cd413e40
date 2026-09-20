@@ -71,6 +71,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/v1/policies/{id}` | 获取策略全文 |
 | DELETE | `/api/v1/policies/{id}` | 删除策略 |
 | POST | `/api/v1/policies/{id}/evaluate` | 提交事实进行裁决 |
+| POST | `/api/v1/policies/{id}/evaluate-sources` | 多来源带优先级事实合并后裁决（逐字段只比较最高优先级来源） |
 | POST | `/api/v1/policies/{id}/counterfactuals` | 反事实搜索：让裁决唯一变为目标结论的最小修改集 |
 | POST | `/api/v1/policies/{id}/batch-data-plans` | 批量数据方案：让全部 unknown 案例可判定的最小全局字段集合 |
 | POST | `/api/v1/policies/{id}/replacement-preview` | 替换影响预览：候选规则对案例集的业务影响（不写入存储） |
@@ -172,6 +173,96 @@ curl -s -X POST localhost:8000/api/v1/policies/$PID/evaluate \
 { "status": "conflict", "reason": "opposite_conclusions",
   "conflicting_conclusions": ["no", "yes"], "decided_priority": 1 }
 ```
+
+## 多来源事实合并裁决示例（evaluate-sources）
+
+一次请求携带**多组具名事实来源**，每组带来源名、**整数优先级**（越大越优先）
+与一组 `facts`。服务**逐字段**做合并，再把合并后的事实交给与
+`/evaluate` 完全相同的裁决引擎：
+
+- 对每个字段，只收集**提供该字段的最高优先级**来源（低优先级一律丢弃，
+  记为 `lower_priority`）：
+  - 最高优先级各来源的值**严格相同且非 null** → 字段 `resolved`，采用该值，
+    所有一致来源列入 `adopted_sources`（严格相等沿用引擎的 JSON 类型规则，
+    如 `true != 1`）；
+  - 最高优先级的值**不一致** → 字段 `unresolved`（`reason` 为
+    `conflicting_values`），`conflicting_values` 给出去重后的冲突值；
+  - 最高优先级出现 **`null`** → 字段 `unresolved`（仅 null 时 `reason` 为
+    `null_value`，null 与其他值并存时为 `conflicting_values`）。
+- **低优先级来源永不回填**：最高优先级冲突或含 null 时，该字段不进入
+  `merged_facts`（裁决引擎视其为缺失 → 通常导致 `unknown`），低优先级值
+  仅在 `discarded_sources` 中留痕。
+- 结果与来源在请求中的**排列顺序无关**：来源按 `(-priority, name)` 处理，
+  字段、来源名、冲突值均做确定性排序输出。
+
+请求体：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `sources` | 非空数组 | 元素为 `{"name": <非空字符串>, "priority": <整数>, "facts": <对象>}`；`facts` 缺省视为 `{}`，可显式含 null |
+
+非法请求（来源重名、`sources` 为空/缺失、`priority` 非整数或为布尔、
+`name` 非空字符串校验失败、`facts` 不是字符串键对象、元素不是对象、含未知
+键等）返回 `422`，响应体含 `errors` 列表；策略不存在返回 `404`。
+
+```bash
+curl -s -X POST localhost:8000/api/v1/policies/$PID/evaluate-sources \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "sources": [
+      {"name": "bureau", "priority": 100,
+       "facts": {"income": 80000, "debt_ratio": 0.2}},
+      {"name": "bank",   "priority": 100, "facts": {"income": 40000}},
+      {"name": "form",   "priority": 1,
+       "facts": {"income": 80000, "debt_ratio": 0.2, "vip": true}}
+    ]
+  }'
+```
+
+上例中 `income` 在最高优先级 100 上冲突（80000 vs 40000），`form` 的
+80000 不得回填，字段标记为 `unresolved`；`debt_ratio` 与 `vip` 无更高优先级
+竞争，正常采用。响应（节选）：
+
+```json
+{
+  "policy_id": "ab12...",
+  "source_count": 3,
+  "merged_facts": {"debt_ratio": 0.2, "vip": true},
+  "unresolved_fields": ["income"],
+  "fields": {
+    "income": {
+      "status": "unresolved",
+      "reason": "conflicting_values",
+      "adopted_sources": [],
+      "discarded_sources": [
+        {"source": "bank",   "priority": 100, "value": 40000, "reason": "conflicting_values"},
+        {"source": "bureau", "priority": 100, "value": 80000, "reason": "conflicting_values"},
+        {"source": "form",   "priority": 1,   "value": 80000, "reason": "lower_priority"}
+      ],
+      "conflicting_values": [40000, 80000]
+    },
+    "debt_ratio": {
+      "status": "resolved", "value": 0.2,
+      "adopted_sources": ["bureau"],
+      "discarded_sources": [
+        {"source": "form", "priority": 1, "value": 0.2, "reason": "lower_priority"}
+      ]
+    },
+    "vip": {"status": "resolved", "value": true,
+            "adopted_sources": ["form"], "discarded_sources": []}
+  },
+  "verdict": { "status": "unknown", "conclusion": null,
+               "missing_fields": ["income"], "level_trace": { "...": "..." } }
+}
+```
+
+- `fields` 逐字段给出**采用来源**（`adopted_sources`）与**丢弃来源**
+  （`discarded_sources`，含来源名、优先级、该来源提供的值与丢弃原因）；
+  `unresolved` 字段额外给出 `conflicting_values`（null 参与时包含 `null`）。
+- `verdict` 是用 `merged_facts` 调用现有裁决引擎得到的**完整裁决结果**
+  （结构与 `/evaluate` 一致，含 `levels_trace` / `level_trace` 等轨迹）；
+  unresolved 字段等价于事实缺失，因此三值逻辑、最小缺失字段集合等语义全部
+  原样适用。
 
 ## 反事实修改示例（counterfactuals）
 
@@ -494,6 +585,7 @@ app/
   validation.py      # 策略结构校验、反事实/批量/替换预览/裁决流请求校验
   logic.py           # 三值逻辑、最小决定族、比较可行性
   engine.py          # 优先级分层、冲突/未知/无匹配裁决、轨迹
+  sources.py         # 多来源带优先级事实合并：最高优先级比较、冲突/null 不回填
   counterfactual.py  # 反事实最小修改集枚举、剪枝与稳定排序
   batch.py           # 批量数据方案：逐案裁决、全局最小字段集合组合
   preview.py         # 替换影响预览：业务签名、变化列表与迁移汇总
@@ -512,7 +604,8 @@ pip install -r requirements-dev.txt
 python -m pytest tests/ -q
 # 或无需 pytest（tests 内置 runner）：
 python3 tests/test_logic.py && python3 tests/test_engine.py && \
-python3 tests/test_api.py && python3 tests/test_counterfactual.py && \
+python3 tests/test_api.py && python3 tests/test_evaluate_sources.py && \
+python3 tests/test_counterfactual.py && \
 python3 tests/test_batch_data_plans.py && \
 python3 tests/test_replacement_preview.py && python3 tests/test_flow.py
 ```

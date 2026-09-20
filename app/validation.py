@@ -21,10 +21,20 @@ MAX_BATCH_CASES = 1000
 MAX_CASE_ID_LENGTH = 200
 MAX_FLOW_NODES = 500
 MAX_FLOW_ROUTES = 100
+MAX_FACT_SOURCES = 1000
+MAX_SOURCE_NAME_LENGTH = 200
 FLOW_ROUTE_STATUSES = ("decided", "unknown", "conflict", "no_match")
 
 
 class PolicyValidationError(ValueError):
+    def __init__(self, errors: list[str]):
+        self.errors = errors
+        super().__init__("; ".join(errors))
+
+
+class SourceValidationError(ValueError):
+    """Raised when a multi-source fact request body is malformed."""
+
     def __init__(self, errors: list[str]):
         self.errors = errors
         super().__init__("; ".join(errors))
@@ -541,3 +551,79 @@ def _find_reachable_cycle(
             stack.pop()
             path.pop()
     return None
+
+
+def validate_evaluate_sources_request(payload: Any) -> list[dict]:
+    """Validate an evaluate-sources request body.
+
+    The body must be ``{"sources": [{"name", "priority", "facts"}, ...]}``
+    with a non-empty array of uniquely named sources whose ``priority`` is an
+    integer and whose ``facts`` is an object with string keys.  Returns the
+    normalized sources list; raises :class:`SourceValidationError` with one
+    error string per detected problem.
+    """
+    errors: list[str] = []
+
+    if not isinstance(payload, dict):
+        raise SourceValidationError(["request body must be an object"])
+
+    raw_sources = payload.get("sources")
+    if not isinstance(raw_sources, list) or not raw_sources:
+        raise SourceValidationError(["sources: must be a non-empty array"])
+    if len(raw_sources) > MAX_FACT_SOURCES:
+        errors.append(
+            f"sources: at most {MAX_FACT_SOURCES} sources are allowed"
+        )
+
+    seen_names: set[str] = set()
+    normalized: list[dict] = []
+
+    for index, source in enumerate(raw_sources):
+        prefix = f"sources[{index}]"
+        if not isinstance(source, dict):
+            errors.append(f"{prefix}: must be an object")
+            continue
+
+        unknown_keys = set(source) - {"name", "priority", "facts"}
+        if unknown_keys:
+            errors.append(f"{prefix}: unknown keys {sorted(unknown_keys)}")
+
+        name = source.get("name")
+        if not isinstance(name, str) or not name.strip():
+            errors.append(f"{prefix}.name: must be a non-empty string")
+        elif len(name) > MAX_SOURCE_NAME_LENGTH:
+            errors.append(
+                f"{prefix}.name: must be at most "
+                f"{MAX_SOURCE_NAME_LENGTH} characters"
+            )
+        elif name in seen_names:
+            errors.append(f"{prefix}.name: duplicate source name {name!r}")
+        else:
+            seen_names.add(name)
+
+        priority = source.get("priority")
+        if isinstance(priority, bool) or not isinstance(priority, int):
+            errors.append(f"{prefix}.priority: must be an integer")
+        elif not -MAX_PRIORITY <= priority <= MAX_PRIORITY:
+            errors.append(
+                f"{prefix}.priority: must be between -{MAX_PRIORITY} and "
+                f"{MAX_PRIORITY}"
+            )
+
+        facts = source.get("facts", {})
+        if not isinstance(facts, dict) or not all(
+            isinstance(key, str) for key in facts
+        ):
+            errors.append(
+                f"{prefix}.facts: must be an object with string keys"
+            )
+            facts = {}
+
+        normalized.append(
+            {"name": name, "priority": priority, "facts": facts}
+        )
+
+    if errors:
+        raise SourceValidationError(errors)
+
+    return normalized

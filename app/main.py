@@ -13,11 +13,14 @@ from .counterfactual import CounterfactualSearchError, counterfactuals
 from .engine import adjudicate
 from .flow import run_flow
 from .preview import replacement_preview
+from .sources import merge_fact_sources
 from .store import store
 from .validation import (
     PolicyValidationError,
+    SourceValidationError,
     validate_batch_data_plans_request,
     validate_counterfactual_request,
+    validate_evaluate_sources_request,
     validate_flow_request,
     validate_policy,
     validate_replacement_preview_request,
@@ -40,7 +43,9 @@ app = FastAPI(
         "report the business-impact changes without touching storage. "
         "Adjudication flows chain stored policies through verdict routes "
         "and return the termination reason, the final business signature "
-        "and the ordered node trace."
+        "and the ordered node trace. Source-based evaluation merges facts "
+        "from multiple named, integer-priority sources per field before "
+        "adjudicating with the same engine."
     ),
 )
 
@@ -84,6 +89,19 @@ async def batch_plan_search_handler(
         content={
             "detail": "Batch data plan search failed",
             "errors": [str(exc)],
+        },
+    )
+
+
+@app.exception_handler(SourceValidationError)
+async def source_validation_handler(
+    request: Request, exc: SourceValidationError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={
+            "detail": "Fact source validation failed",
+            "errors": exc.errors,
         },
     )
 
@@ -169,6 +187,44 @@ async def evaluate_policy(policy_id: str, body: Optional[EvaluateRequest] = None
     verdict = adjudicate(record, facts)
     verdict["policy_id"] = policy_id
     return verdict
+
+
+@app.post(
+    f"{API_PREFIX}/policies/{{policy_id}}/evaluate-sources",
+    tags=["adjudication"],
+)
+async def evaluate_policy_sources(policy_id: str, request: Request) -> dict:
+    """Merge priority-ordered named fact sources, then adjudicate.
+
+    For every field only the sources providing it at the highest priority
+    participate: strictly equal non-null values are adopted, while null or
+    disagreeing values leave the field ``unresolved`` (lower-priority sources
+    are reported as discarded and never backfill).  The merged facts are then
+    adjudicated with the regular engine.
+    """
+    record = store.get(policy_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Policy not found")
+
+    payload = await _json_body(request)
+    sources = validate_evaluate_sources_request(payload)
+
+    merged = merge_fact_sources(sources)
+    verdict = adjudicate(record, merged["facts"])
+
+    # Field reports sorted by field name for a stable response envelope.
+    merged_fields = {
+        field: merged["fields"][field]
+        for field in sorted(merged["fields"])
+    }
+    return {
+        "policy_id": policy_id,
+        "source_count": len(sources),
+        "merged_facts": merged["facts"],
+        "unresolved_fields": merged["unresolved_fields"],
+        "fields": merged_fields,
+        "verdict": verdict,
+    }
 
 
 @app.post(
