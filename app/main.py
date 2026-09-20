@@ -13,11 +13,13 @@ from .counterfactual import CounterfactualSearchError, counterfactuals
 from .engine import adjudicate
 from .flow import run_flow
 from .preview import replacement_preview
+from .sources import evaluate_sources
 from .store import store
 from .validation import (
     PolicyValidationError,
     validate_batch_data_plans_request,
     validate_counterfactual_request,
+    validate_evaluate_sources_request,
     validate_flow_request,
     validate_policy,
     validate_replacement_preview_request,
@@ -40,7 +42,10 @@ app = FastAPI(
         "report the business-impact changes without touching storage. "
         "Adjudication flows chain stored policies through verdict routes "
         "and return the termination reason, the final business signature "
-        "and the ordered node trace."
+        "and the ordered node trace. Multi-source evaluation merges named, "
+        "prioritized fact sources per field — highest-priority agreement "
+        "adopts a value, disagreement or null leaves the field unresolved "
+        "without lower-priority backfill — and adjudicates the merged facts."
     ),
 )
 
@@ -254,6 +259,34 @@ async def policy_replacement_preview(policy_id: str, request: Request) -> dict:
         "changes": changes,
         "transition_counts": transition_counts,
     }
+
+
+@app.post(
+    f"{API_PREFIX}/policies/{{policy_id}}/evaluate-sources",
+    tags=["adjudication"],
+)
+async def policy_evaluate_sources(policy_id: str, request: Request) -> dict:
+    """Merge named, prioritized fact sources, then adjudicate the result.
+
+    Each source contributes a ``facts`` object under an integer
+    ``priority``.  Per field, only the highest-priority sources providing
+    the field are compared: strictly equal non-null values are adopted,
+    disagreement or a null value leaves the field unresolved (absent from
+    the merged facts, hence unknown to the engine); lower-priority sources
+    never backfill.  The outcome does not depend on source order.  The
+    response reports the adopted/discarded sources and conflicting values
+    per field together with the full adjudication verdict.
+    """
+    record = store.get(policy_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Policy not found")
+
+    payload = await _json_body(request)
+    sources = validate_evaluate_sources_request(payload)
+
+    result = evaluate_sources(record, sources)
+    result["policy_id"] = policy_id
+    return result
 
 
 @app.post(f"{API_PREFIX}/adjudication-flows/evaluate", tags=["adjudication"])

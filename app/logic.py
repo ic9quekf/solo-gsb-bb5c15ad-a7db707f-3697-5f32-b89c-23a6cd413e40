@@ -156,9 +156,9 @@ def compare_values(left: Any, op: str, right: Any) -> tuple[bool, Optional[str]]
     FALSE solely because the types are not orderable/comparable.
     """
     if op == "eq":
-        return (_strict_eq(left, right), None)
+        return (strict_eq(left, right), None)
     if op == "ne":
-        return (not _strict_eq(left, right), None)
+        return (not strict_eq(left, right), None)
 
     if not _same_kind(left, right):
         return (False, "type_mismatch")
@@ -178,7 +178,12 @@ def compare_values(left: Any, op: str, right: Any) -> tuple[bool, Optional[str]]
     raise ValueError(f"unknown comparison operator: {op}")
 
 
-def _strict_eq(left: Any, right: Any) -> bool:
+def strict_eq(left: Any, right: Any) -> bool:
+    """Strict JSON-style equality shared by comparisons and source merging.
+
+    Booleans are distinct from numbers (``True != 1``); integers and floats
+    compare as numbers (``1 == 1.0``); lists and dicts compare element-wise.
+    """
     if isinstance(left, bool) != isinstance(right, bool):
         return False
     if isinstance(left, (int, float)) and not isinstance(left, bool):
@@ -191,12 +196,12 @@ def _strict_eq(left: Any, right: Any) -> bool:
         return (
             isinstance(right, list)
             and len(left) == len(right)
-            and all(_strict_eq(a, b) for a, b in zip(left, right))
+            and all(strict_eq(a, b) for a, b in zip(left, right))
         )
     if isinstance(left, dict):
         if not isinstance(right, dict) or set(left) != set(right):
             return False
-        return all(_strict_eq(left[k], right[k]) for k in left)
+        return all(strict_eq(left[k], right[k]) for k in left)
     return left == right and type(left) is type(right)
 
 

@@ -71,6 +71,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/v1/policies/{id}` | 获取策略全文 |
 | DELETE | `/api/v1/policies/{id}` | 删除策略 |
 | POST | `/api/v1/policies/{id}/evaluate` | 提交事实进行裁决 |
+| POST | `/api/v1/policies/{id}/evaluate-sources` | 多来源事实合并：按来源优先级逐字段取舍后裁决 |
 | POST | `/api/v1/policies/{id}/counterfactuals` | 反事实搜索：让裁决唯一变为目标结论的最小修改集 |
 | POST | `/api/v1/policies/{id}/batch-data-plans` | 批量数据方案：让全部 unknown 案例可判定的最小全局字段集合 |
 | POST | `/api/v1/policies/{id}/replacement-preview` | 替换影响预览：候选规则对案例集的业务影响（不写入存储） |
@@ -486,18 +487,99 @@ curl -s -X POST localhost:8000/api/v1/adjudication-flows/evaluate \
 - `steps` 为**有序节点轨迹**：每个被执行节点一条，含该节点的裁决状态、
   结论与实际命中的路由（未命中为 `null`）。
 
+## 多来源事实合并裁决示例（evaluate-sources）
+
+一次请求提交多个**具名、带整数优先级**的事实来源（`sources`），服务按
+**逐字段**合并后再复用裁决引擎：
+
+- 同一字段只比较**提供该字段的最高优先级来源**（同一优先级可并列多个来源）：
+  值**严格相同且非 `null`** → 采用该值（`adopted`）；值不一致或含 `null`
+  → 标记 **unresolved**，该字段不进入合并事实（对引擎而言即 unknown）。
+- **低优先级来源不回填**：最高优先级层无法决定某字段时，低优先级来源对该
+  字段的取值一律丢弃（`discarded`，原因 `lower_priority`），绝不用于补缺；
+  只有某字段完全未出现在更高优先级来源中时，低优先级来源才会被采用。
+- **来源顺序无关**：合并结果只取决于来源集合，请求中 `sources` 的排列
+  （包括响应中所有列表的确定性排序）不影响响应内容。
+- 严格相等与引擎一致：`true != 1`，数字 `1 == 1.0`，数组/对象按元素递归
+  比较。
+
+请求体：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `sources` | 非空数组 | 元素为 `{"name": <非空字符串>, "priority": <整数>, "facts": <对象>}`；`name` 在请求内唯一，`facts` 缺省视为 `{}` |
+
+来源重名、`sources` 为空/不是数组、元素缺 `name`/`priority` 非法、`facts`
+不是对象、含未知键等返回 `422`，响应体含 `errors` 列表；策略不存在返回
+`404`。
+
+```bash
+curl -s -X POST localhost:8000/api/v1/policies/$PID/evaluate-sources \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "sources": [
+      {"name": "crm",         "priority": 100,
+       "facts": {"income": 80000, "debt_ratio": 0.5}},
+      {"name": "application", "priority": 100,
+       "facts": {"income": 80000, "debt_ratio": 0.3}},
+      {"name": "legacy",      "priority": 10,
+       "facts": {"debt_ratio": 0.2}}
+    ]
+  }'
+```
+
+响应（节选；以上面“裁决示例”中创建的策略为例）：
+
+```json
+{
+  "policy_id": "ab12...",
+  "source_count": 3,
+  "sources": [ {"name": "application", "priority": 100},
+               {"name": "crm", "priority": 100},
+               {"name": "legacy", "priority": 10} ],
+  "merged_facts": { "income": 80000 },
+  "fields": [
+    { "field": "debt_ratio", "status": "unresolved", "priority": 100,
+      "reason": "conflicting_values",
+      "conflicts": [ {"source": "application", "value": 0.3},
+                     {"source": "crm", "value": 0.5} ],
+      "discarded": [ {"source": "legacy", "priority": 10, "value": 0.2,
+                      "reason": "lower_priority"} ] },
+    { "field": "income", "status": "adopted", "priority": 100,
+      "value": 80000,
+      "adopted_from": ["application", "crm"],
+      "discarded": [] }
+  ],
+  "unresolved_fields": ["debt_ratio"],
+  "verdict": { "status": "unknown", "decided_priority": 10,
+               "missing_fields": ["debt_ratio"],
+               "minimal_missing_field_sets": [["debt_ratio"]],
+               "pending_conclusions": ["approve", "reject"],
+               "level_trace": { "...": "..." }, "levels_trace": [ "..." ] }
+}
+```
+
+即：`income` 两个最高优先级来源一致 → 采用；`debt_ratio` 在最高优先级层
+冲突（0.5 vs 0.3）→ unresolved，`legacy` 的 0.2 **不回填**；合并事实只有
+`income`，引擎裁决为 `unknown` 并指出补全 `debt_ratio` 即可判定。响应中
+`verdict` 是**完整裁决结果**（与 `/evaluate` 相同结构），`fields` 逐字段
+给出采用来源（`adopted_from`）、丢弃来源（`discarded`）与冲突值
+（`conflicts`）；若最高优先级层一致但为 `null`，`reason` 为
+`null_value`，同样视为 unresolved。
+
 ## 项目结构
 
 ```
 app/
   main.py            # FastAPI 路由、健康检查、请求模型
-  validation.py      # 策略结构校验、反事实/批量/替换预览/裁决流请求校验
+  validation.py      # 策略结构校验、反事实/批量/替换预览/裁决流/多来源请求校验
   logic.py           # 三值逻辑、最小决定族、比较可行性
   engine.py          # 优先级分层、冲突/未知/无匹配裁决、轨迹
   counterfactual.py  # 反事实最小修改集枚举、剪枝与稳定排序
   batch.py           # 批量数据方案：逐案裁决、全局最小字段集合组合
   preview.py         # 替换影响预览：业务签名、变化列表与迁移汇总
   flow.py            # 裁决流：逐节点裁决、按裁决结果路由与终止
+  sources.py         # 多来源事实合并：逐字段优先级取舍、冲突标记与裁决
   store.py           # 加锁的内存策略存储
 tests/               # 纯标准库 runner，也可用 pytest
 Dockerfile
@@ -514,5 +596,6 @@ python -m pytest tests/ -q
 python3 tests/test_logic.py && python3 tests/test_engine.py && \
 python3 tests/test_api.py && python3 tests/test_counterfactual.py && \
 python3 tests/test_batch_data_plans.py && \
-python3 tests/test_replacement_preview.py && python3 tests/test_flow.py
+python3 tests/test_replacement_preview.py && python3 tests/test_flow.py && \
+python3 tests/test_evaluate_sources.py
 ```

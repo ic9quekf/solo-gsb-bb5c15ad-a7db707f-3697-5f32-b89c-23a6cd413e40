@@ -21,6 +21,7 @@ MAX_BATCH_CASES = 1000
 MAX_CASE_ID_LENGTH = 200
 MAX_FLOW_NODES = 500
 MAX_FLOW_ROUTES = 100
+MAX_SOURCES = 1000
 FLOW_ROUTE_STATUSES = ("decided", "unknown", "conflict", "no_match")
 
 
@@ -323,6 +324,76 @@ def validate_replacement_preview_request(payload: Any) -> tuple[list[dict], list
     if errors:
         raise PolicyValidationError(errors)
     return rules, cases
+
+
+def validate_evaluate_sources_request(payload: Any) -> list[dict]:
+    """Validate an evaluate-sources request body.
+
+    Returns the normalized ``sources`` list (one ``{"name", "priority",
+    "facts"}`` dict per source, ``facts`` defaulting to ``{}``); raises
+    :class:`PolicyValidationError` with one error string per detected
+    problem.  Source names must be unique within the request.
+    """
+    if not isinstance(payload, dict):
+        raise PolicyValidationError(["request body must be an object"])
+
+    errors: list[str] = []
+
+    raw_sources = payload.get("sources")
+    if not isinstance(raw_sources, list) or not raw_sources:
+        raise PolicyValidationError(["sources: must be a non-empty array"])
+    if len(raw_sources) > MAX_SOURCES:
+        errors.append(f"sources: at most {MAX_SOURCES} sources are allowed")
+
+    name_counts = Counter(
+        source["name"]
+        for source in raw_sources
+        if isinstance(source, dict) and isinstance(source.get("name"), str)
+    )
+
+    normalized: list[dict] = []
+    for index, source in enumerate(raw_sources):
+        prefix = f"sources[{index}]"
+        if not isinstance(source, dict):
+            errors.append(f"{prefix}: must be an object")
+            continue
+        unknown_keys = set(source) - {"name", "priority", "facts"}
+        if unknown_keys:
+            errors.append(f"{prefix}: unknown keys {sorted(unknown_keys)}")
+
+        name = source.get("name")
+        if not isinstance(name, str) or not name.strip():
+            errors.append(f"{prefix}.name: must be a non-empty string")
+        elif len(name) > MAX_ID_LENGTH:
+            errors.append(
+                f"{prefix}.name: must be at most {MAX_ID_LENGTH} characters"
+            )
+        elif name_counts[name] > 1:
+            errors.append(f"{prefix}.name: duplicate source name {name!r}")
+
+        priority = source.get("priority")
+        if isinstance(priority, bool) or not isinstance(priority, int):
+            errors.append(f"{prefix}.priority: must be an integer")
+        elif not -MAX_PRIORITY <= priority <= MAX_PRIORITY:
+            errors.append(
+                f"{prefix}.priority: must be between -{MAX_PRIORITY} and "
+                f"{MAX_PRIORITY}"
+            )
+
+        facts = source.get("facts", {})
+        if not isinstance(facts, dict) or not all(
+            isinstance(k, str) for k in facts
+        ):
+            errors.append(
+                f"{prefix}.facts: must be an object with string keys"
+            )
+            facts = {}
+
+        normalized.append({"name": name, "priority": priority, "facts": facts})
+
+    if errors:
+        raise PolicyValidationError(errors)
+    return normalized
 
 
 def validate_flow_request(
